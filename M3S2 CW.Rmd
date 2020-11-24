@@ -1,0 +1,415 @@
+---
+title: "M3S2 CW"
+author: "Juliette Limozin"
+date: " Due 09/03/2020"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+library(numbers)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stats)
+library(tibble)
+library(forecast)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+#Exploratory analysis of the data
+
+```{r}
+summary(dat)
+summarise(dat, 'Rest pulse SD'= sd(rest_pulse), 'Stimulated pulse SD'= sd(stimulated_pulse), 'BMI SD'= sd(bmi))
+ggplot(dat) +
+  #geom_bar(aes(stimulated_pulse), colour = "red")+
+  geom_bar(aes(bmi), colour = "blue") +
+  labs(title = "Distribution of BMI")
+```
+##Correlation
+
+```{r}
+cat("Correlation between stimulated and rest pulses: \n",cor(dat$rest_pulse, dat$stimulated_pulse))
+cat("\n")
+cat("Correlation between stimulated pulse and BMI: \n",cor(dat$bmi, dat$stimulated_pulse))
+```
+
+#Clinicians' initial model
+
+Includes measures and diagnostic plots
+```{r}
+fit0<-lm(dat$stimulated_pulse~dat$rest_pulse + dat$bmi)
+summary(fit0)
+plot(fit0)
+anova(fit0)
+cat("AIC: ",AIC(fit0))
+cat("\n")
+cat("Confidence interval of beta: \n")
+print(confint.lm(fit0, level = 0.95))
+ggplot(dat)+
+  geom_jitter(aes(bmi, fit0$fitted.values, colour = "model")) +
+  geom_jitter(aes(bmi, stimulated_pulse, colour = "data")) +
+  labs( x = "BMI", y = "Stimulated Pulse",
+   title ="Fitted vs Actual with Clinicians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+ggplot(dat)+
+  geom_jitter(aes(rest_pulse, fit0$fitted.values, colour = "model")) +
+  geom_jitter(aes(rest_pulse, stimulated_pulse, colour = "data")) +
+  labs( x = "Rest pulse", y = "Stimulated Pulse",
+   title ="Fitted vs Actual with Clinicians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+```
+# Statistician's model
+
+In-built version to sense check against the GLM I created manually: (includes diagnostic plots)
+```{r in-built glm to sense-check}
+y <- dat$stimulated_pulse-dat$rest_pulse
+fit1<- glm(y~dat$bmi,family=Gamma(link="inverse"))
+summary(fit1)
+cat("AIC: ",AIC(fit1))
+cat("\n")
+cat("Confidence interval of beta: \n")
+print(confint.lm(fit1, level = 0.95))
+plot(fit1)
+```
+
+My version of the GLM:
+
+```{r manual gamma GLM with inverse link function}
+
+#Manually made GLM function
+statglm <- function(d, tt = TRUE){ #inputs: d = dataset, tt is indicator for if we want a summary or not
+  beta <- c(0.05,0) #initial estimate is 1/mean(Bmi), 0
+  X <- cbind(1, d$bmi) #design matrix 
+  y <- d$stimulated_pulse-d$rest_pulse #response output
+  jj <- 0
+  #Inverse of the link function (in this case it's the inverse function too)
+  inv.link <-function(u){
+    1/u
+  }
+  #Deviance function = 2*(l(y) - l(mu))
+  D <- function(u){
+    a = -1-log(y)
+    b = y/u + log(u)
+    2*sum(a+b)
+  }
+  oldD <- D(inv.link(as.numeric(X%*%beta))) #Current deviance
+  while(jj ==0){
+    eta = X%*%beta 
+    mu <- inv.link(eta) #mu = 1/eta
+    detadmu <- -1/(mu^2) #deta/dmu
+    z <- eta +(y-mu)*detadmu #z
+    w = mu^2 #weights
+    lmod <- lm(z~d$bmi, weights=w) # regress z onto x with weights w
+    beta <- as.vector(lmod$coeff) #new estimate of parameters beta
+    newD <- D(inv.link(X%*%beta)) #new deviance
+    control <- abs(newD-oldD)/(abs(newD)+0.1)
+    if (isTRUE(control<1e-8)){
+      jj<-1} #stop the algorithm when the control factor is small enough
+    oldD <- newD
+  }
+  
+  #Calculate statistics for diagnostics:
+  J<- t(X)%*%diag(as.vector(w))%*%X
+  invJ <-solve(J)
+  beta.sd <- sqrt(as.vector(diag(invJ)))  #Standard errors
+  t_value<- beta/beta.sd #t value
+  p_value <- 2*pt(-abs(t_value), df=nrow(d)-ncol(d)) #p value
+  errors <- as.vector(y - inv.link(X%*%beta)) #Residuals
+  RSS <- t(errors)%*%errors #Residual sum of squares
+  sst <- t(y-mean(y))%*%(y-mean(y)) #Total sum of squres
+  R2 <- 1- RSS/sst #R-squared
+  AR2 <- 1- (1-R2)*(nrow(d)-1)/(nrow(d)-ncol(X)) #Adjusted R-squared
+  MSE <- RSS/(nrow(d)-ncol(X)) #MSE
+  MSR <- (sst-RSS)/(ncol(X)-1) #MSR
+  F_value <- MSR/MSE #F-statistic
+  coeff <- data.frame(beta, beta.sd, t_value, p_value)
+  dev <- c(sign(y[1]-mu[1])*sqrt(D(inv.link(X[1,]%*%beta))))
+  for (i in 2:nrow(d)){
+    dev <- c(dev,sign(y[i]-mu[i])*sqrt(D(inv.link(X[i,]%*%beta)))) #Deviance residuals
+  }
+  dev <- summary(dev) #Deviance residuals
+  phi <- newD/(nrow(d)-2) #estimated dispersion parameters
+  AIC <- -2*sum(dgamma(y, 1/phi, 1/(phi*mu), log = TRUE)) + 2*2 #AIC
+  if (tt == TRUE){
+    cat("Deviance residuals:\n")
+    print(dev)
+    cat("\n")
+    cat("Coefficients:\n") 
+    printCoefmat(coeff)
+    cat("\n")
+    cat("Residuals deviance: ",newD)
+    cat("\n")
+    cat("R-Squared: ", R2)
+    cat(",\tAdjusted R-Squared: ", AR2,
+	    "\nF-statistic:", F_value,
+	    "with", nrow(d)-2-1, "DF")
+    cat("\n")
+    cat("AIC : ", AIC)
+  }
+  else{
+  return(list("model" = inv.link(X%*%beta), "y" = y))}
+}
+
+statglm(dat, tt = TRUE)
+```
+Diagnostic plots
+
+```{r,warning=FALSE}
+ggplot(dat)+
+  geom_jitter(aes(bmi, statglm(dat, tt = FALSE)$model, colour = "model")) +
+  geom_jitter(aes(bmi, statglm(dat, tt = FALSE)$y, colour = "data")) +
+  labs( x = "BMI", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Statisticians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+```
+
+#Binomial GLM
+
+Modified version of the previous function
+
+```{r,  warning=FALSE}
+binomglm <- function(d, tt = TRUE){
+  beta <- c(0.05,0)
+  X <- cbind(1, d$bmi)
+  y <- d$stimulated_pulse-d$rest_pulse
+  jj <- 0
+  inv.link <-function(u){
+    nrow(d)*(1/(1+exp(-u)))
+  }
+  D <- function(u){
+    a <- y*log(y/u)
+    b = (nrow(d)-y)*log((nrow(d)-y)/(nrow(d)-u))
+    a[y == 0] <- 0
+    2*sum(a+b)
+  }
+  oldD <- D(inv.link(as.numeric(X%*%beta)))
+  while(jj ==0){
+    eta <- X%*%beta
+    mu <- inv.link(eta)
+    detadmu <- nrow(d)/(mu*(nrow(d)-mu))
+    z <- eta +(y-mu)*detadmu
+    w = mu*(nrow(d)-mu)/nrow(d)
+    lmod <- lm(z~d$bmi, weights=w)
+    beta <- as.vector(lmod$coeff)
+    newD <- D(inv.link(X%*%beta))
+    control <- abs(newD-oldD)/(abs(newD)+0.1)
+    if (isTRUE(control<1e-8)){
+      jj<-1}
+    oldD <- newD
+  }
+  J<- t(X)%*%diag(as.vector(w))%*%X
+  invJ <-solve(J)
+  beta.sd <- sqrt(as.vector(diag(invJ)))
+  t_value<- beta/beta.sd
+  p_value <- 2*pt(-abs(t_value), df=nrow(d)-ncol(d))
+  errors <- as.vector(y - inv.link(X%*%beta))
+  RSS <- t(errors)%*%errors
+  sst <- t(y-mean(y))%*%(y-mean(y))
+  R2 <- 1- RSS/sst
+  AR2 <- 1- (1-R2)*(nrow(d)-1)/(nrow(d)-2)
+  MSE <- RSS/(nrow(d)-2)
+  MSR <- (sst-RSS)/(2-1)
+  F_value <- MSR/MSE
+  coeff <- data.frame(beta, beta.sd, t_value, p_value)
+  dev <- c(sign(y[1]-mu[1])*sqrt(D(inv.link(X[1,]%*%beta))))
+  for (i in 2:nrow(d)){
+    dev <- c(dev,sign(y[i]-mu[i])*sqrt(D(inv.link(X[i,]%*%beta))))
+  }
+  dev <- summary(dev)
+  phi <- newD/(nrow(d)-2)
+  AIC <- -2*sum(dbinom(y, nrow(d), as.vector(mu/nrow(d)), log = TRUE)) + 2*2
+  if (tt == TRUE){
+    cat("Deviance residuals:\n")
+    print(dev)
+    cat("\n")
+    cat("Coefficients:\n") 
+    printCoefmat(coeff)
+    cat("\n")
+    cat("Residuals deviance: ",newD)
+    cat("\n")
+    cat("R-Squared: ", R2)
+    cat(",\tAdjusted R-Squared: ", AR2,
+	    "\nF-statistic:", F_value,
+	    "with", nrow(d)-2-1, "DF")
+    cat("\n")
+    cat("AIC : ", AIC)
+  }
+  else{
+  return(list("model" = inv.link(X%*%beta), "y" = y))}
+}
+
+binomglm(dat, tt  = TRUE)
+
+mylabs=list("Data", "Model") #labels for plots
+#plot of model vs data
+ggplot(dat)+
+  geom_jitter(aes(bmi, binomglm(dat, tt = FALSE)$model, colour = "model")) +
+  geom_jitter(aes(bmi, binomglm(dat, tt = FALSE)$y, colour = "data")) +
+  labs( x = "BMI", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Statisticians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+
+
+```
+
+
+#Poisson GLM
+
+Modified version of the previous function
+
+```{r, warning=FALSE}
+poissonglm <- function(d, tt = TRUE){
+  beta <- c(0.05,0)
+  X <- cbind(1, d$bmi)
+  y <- d$stimulated_pulse-d$rest_pulse
+  jj <- 0
+  D <- function(u){
+    2*sum(y*log(y/u)-y+u)
+  }
+  oldD <- D(as.numeric(X%*%beta))
+  while(jj ==0){
+    eta <- X%*%beta
+    mu <- eta
+    z <- eta +(y-mu)
+    w = 1/mu
+    lmod <- lm(z~d$bmi, weights=w)
+    beta <- as.vector(lmod$coeff)
+    newD <- D(X%*%beta)
+    control <- abs(newD-oldD)/(abs(newD)+0.1)
+    if (isTRUE(control<1e-8)){
+      jj<-1}
+    oldD <- newD
+  }
+  J<- t(X)%*%diag(as.vector(w))%*%X
+  invJ <-solve(J)
+  beta.sd <- sqrt(as.vector(diag(invJ)))
+  t_value<- beta/beta.sd
+  p_value <- 2*pt(-abs(t_value), df=nrow(d)-ncol(d))
+  errors <- as.vector(y - (X%*%beta))
+  RSS <- t(errors)%*%errors
+  sst <- t(y-mean(y))%*%(y-mean(y))
+  R2 <- 1- RSS/sst
+  AR2 <- 1- (1-R2)*(nrow(d)-1)/(nrow(d)-2)
+  MSE <- RSS/(nrow(d)-2)
+  MSR <- (sst-RSS)/(2-1)
+  F_value <- MSR/MSE
+  coeff <- data.frame(beta, beta.sd, t_value, p_value)
+  dev <- c(sign(y[1]-mu[1])*sqrt(D((X[1,]%*%beta))))
+  for (i in 2:nrow(d)){
+    dev <- c(dev,sign(y[i]-mu[i])*sqrt(D((X[i,]%*%beta))))
+  }
+  dev <- summary(dev)
+  phi <- newD/(nrow(d)-2)
+  AIC <- -2*sum(dpois(y, as.vector(mu), log = TRUE)) + 2*2
+  if (tt == TRUE){
+    cat("Deviance residuals:\n")
+    print(dev)
+    cat("\n")
+    cat("Coefficients:\n") 
+    printCoefmat(coeff)
+    cat("\n")
+    cat("Residuals deviance: ",newD)
+    cat("\n")
+    cat("R-Squared: ", R2)
+    cat(",\tAdjusted R-Squared: ", AR2,
+	    "\nF-statistic:", F_value,
+	    "with", nrow(d)-2-1, "DF")
+    cat("\n")
+    cat("AIC : ", AIC)
+  }
+  else{
+  return(list("model" = (X%*%beta), "y" = y, "Residuals" = errors))}
+}
+
+poissonglm(dat, tt  = TRUE)
+
+mylabs=list("Data", "Model") #labels for plots
+#plot of model vs data
+ggplot(dat)+
+  geom_jitter(aes(bmi, poissonglm(dat, tt = FALSE)$model, colour = "model")) +
+  geom_jitter(aes(bmi, poissonglm(dat, tt = FALSE)$y, colour = "data")) +
+  labs( x = "BMI", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Statisticians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+
+```
+
+
+#Gamma GLM with coffee added as covariate
+
+```{r}
+fit2 <- glm(y ~ dat$bmi + dat$coffee_reg, family = Gamma(link = "inverse"))
+summary(fit2)
+cat("Confidence interval of beta: \n")
+print(confint.lm(fit2, level = 0.95))
+
+#plot of model vs data
+ggplot(dat)+
+  geom_jitter(aes(bmi, fit2$fitted.values, colour = "model")) +
+  geom_jitter(aes(bmi, stimulated_pulse - rest_pulse, colour = "data")) +
+  labs( x = "BMI", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Statisticians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+
+ggplot(dat)+
+  geom_jitter(aes(coffee_reg, fit2$fitted.values, colour = "model")) +
+  geom_jitter(aes(coffee_reg, stimulated_pulse - rest_pulse, colour = "data")) +
+  labs( x = "BMI", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Statisticians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+
+plot(fit2)
+````
+
+
+#I mverse gaussian GLM (not considered in the report)
+```{r}
+fit3 <- glm(y ~ dat$bmi + dat$coffee_reg, family = inverse.gaussian())
+summary(fit3)
+cat("Confidence interval of beta: \n")
+print(confint.lm(fit3, level = 0.95))
+
+ggplot(dat)+
+  geom_jitter(aes(bmi, fit3$fitted.values, colour = "model")) +
+  geom_jitter(aes(bmi, stimulated_pulse - rest_pulse, colour = "data")) +
+  labs( x = "BMI", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Statisticians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+
+ggplot(dat)+
+  geom_jitter(aes(coffee_reg, fit3$fitted.values, colour = "model")) +
+  geom_jitter(aes(coffee_reg, stimulated_pulse - rest_pulse, colour = "data")) +
+  labs( x = "BMI", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Statisticians model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+
+plot(fit3)
+````
+
+#Gamma GLM with coffee added and log link function
+```{r}
+fit4 <- glm(y ~ dat$bmi + dat$coffee_reg, family = Gamma(link = "log"))
+summary(fit4)
+cat("Confidence interval of beta: \n")
+print(confint.lm(fit4, level = 0.95))
+
+ggplot(dat)+
+  geom_jitter(aes(bmi, fit4$fitted.values, colour = "model")) +
+  geom_jitter(aes(bmi, stimulated_pulse - rest_pulse, colour = "data")) +
+  labs( x = "BMI", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Best model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+
+ggplot(dat)+
+  geom_jitter(aes(coffee_reg, fit4$fitted.values, colour = "model")) +
+  geom_jitter(aes(coffee_reg, stimulated_pulse - rest_pulse, colour = "data")) +
+  labs( x = "Coffee factor", y = "Difference in Pulse",
+   title ="Fitted vs Actual with Best model") +
+  scale_colour_manual("", values=c("model"="red", "data"="blue"), labels=mylabs)
+
+plot(fit4)
+````
